@@ -1,0 +1,240 @@
+---
+title: Do users & their reviews have any correlation as to whether restaurants remain in business?
+author: "LYE Keng Fook"
+date: "Sunday, 22 November, 2015"
+output: html_document
+---
+
+## Introduction
+Is there a correlation between a restaurant's open/closure (response variable), with the restaurant's reviews and  users giving those reviews? With a correlation, we can fit a regression model and predict if the restaurant is heading towards closure.  This gives insights to help restaurants stay in business. Yelp can also use the prediction model to improve their service towards consumers. 
+
+## Methods and Data
+```{r init libraries, warning=FALSE, message=FALSE, echo=FALSE, cache=TRUE}
+library(cluster)
+library(parallel)
+library(doSNOW)
+coreNumber=max(detectCores(),1)
+cluster=makeCluster(coreNumber, type = "SOCK",outfile="")
+registerDoSNOW(cluster)
+```
+Accuracy & objectivity of the review and user data are important in this investigation. Although reviews and users are likely subjective, I assume any bias effect are eliminated when averaged across a sufficiently large no. of reviews and users. Therefore, a  quantitative treatment of reviews (using aggregate features by taking mean) gives an objective measure of the quality of the restaurant.  
+
+I cleaned the raw data and derive aggregate features from it. Variables are then chosen to fit a logistic regression model, with a binary response variable based on the open attribute in the business file. We then examine the accuracy of the model. 
+
+### Prepare data
+1. We first import the [Yelp dataset](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/yelp_dataset_challenge_academic_dataset.zip) into R. 
+2. Select only restaurants out of the business file.
+3. Select reviews for the restaurants. 
+4. Select users who wrote those reviews.
+5. Tally all checkins for each of those restaurants. 
+6. For review, user & checkin, we then compute aggregate features out of the raw data. 
+7. Finally we merge the restaurant, review, user, checkin into 1 superset dataframe. In other words, we append the user & checkin data to each review. 
+
+Pls see full coding details in [RMD chunk "prep data"](https://a.c.c)
+
+```{r prep data, warning=FALSE, cache=TRUE, echo=FALSE, message=FALSE}
+library(jsonlite)
+library(plyr)
+
+readJSON = function(x) stream_in(file(x), pagesize=50000)
+
+# Pre-requisite: unzip the JSON data files to be in current working directory  
+# Ingest the JSON data files into R
+
+dat = readRDS("yelp_dat")
+business = dat[[1]]
+checkin <- dat[[2]]
+review <- dat[[3]]
+#tip <- dat[[4]]
+user <- dat[[5]]
+
+#business = llply(as.list("yelp_academic_dataset_business.json"), readJSON)[[1]]
+#review = llply(as.list("yelp_academic_dataset_review.json"), readJSON)[[1]]
+#checkin = llply(as.list("yelp_academic_dataset_checkin.json"), readJSON)[[1]]
+#user = llply(as.list("yelp_academic_dataset_user.json"), readJSON)[[1]]
+
+# Select only restaurant businesses and 5 variables
+restaurant = business[ grep("restaurant", business$categories, ignore.case = TRUE), 
+                       c("business_id", "open", "review_count", "name", "stars")]      
+
+### review file
+# Select restaurant reviews
+review = subset(review, business_id %in% restaurant$business_id)
+
+# Sum up all types of votes per review
+review$total_votes = rowSums(review$votes)
+
+# Compute age (in days) of the review
+now = Sys.Date()
+review$age =  as.numeric(now - as.Date(review$date))
+
+library(dplyr)
+
+# Omit unwanted variables: votes, text, type
+review = select(review, -votes, -text, -type)
+
+### checkin file
+# select restaurant checkin's 
+checkin = subset(checkin, business_id %in% restaurant$business_id)
+
+# Sum up all checkin's for the restaurant, exclude NA
+checkin$total_checkins = rowSums(checkin$checkin_info, na.rm = TRUE)
+
+# Omit unwanted variables: checkin_info, type
+checkin = select(checkin, -type, -checkin_info)
+
+
+### user file
+# total no. of votes
+user$total_votes = rowSums(user$votes, na.rm = TRUE)
+
+# total no. of friends
+user$total_friends = lengths(user$friends)  
+
+# no. of years being elite
+user$years_elite = lengths(user$elite)      
+
+# yelping_since in days
+user$yelping_age = as.numeric(Sys.Date() - as.Date(paste0(user$yelping_since, "-01"), "%Y-%m-%d"))
+
+# total no. of compliments
+user$total_compliments = rowSums(user$compliments, na.rm = TRUE)
+
+# Omit unwanted variables
+user = select(user, -type, -name, -votes, -friends, -elite, -yelping_since, -compliments)
+
+### to join/merge dataframes into 1 
+superDat = left_join(restaurant, review, by=c("business_id")) %>%
+    rename(stars.review = stars.y, stars.biz = stars.x) %>%
+    left_join(user, by=c("user_id")) %>% 
+        rename(total_votes.review = total_votes.x, total_votes.user = total_votes.y, 
+           review_count.user = review_count.y, review_count.biz = review_count.x) %>%
+    left_join(checkin, by=c("business_id")) %>%
+    rename(date.review = date, age.review = age, fans.user = fans, average_stars.user = average_stars, 
+           total_friends.user = total_friends, years_elite.user = years_elite, yelping_age.user = yelping_age, 
+           total_compliments.user = total_compliments, total_checkins.biz = total_checkins)
+```
+
+### Explore Data
+```{r explore data, warning=FALSE, echo=FALSE, cache=TRUE}
+summary(superDat)
+```
+Summary of the superset dataframe shows 
+
+1. 93 NA's in some variables as these restaurants have no reviews. We will omit these as we need at least 1 review to proceed.
+2. NA's in total_checkin.biz, we replace these with 0.
+
+I group the review, user and checkin data by restaurant. Then derive summary statistics for each restaurant as follows,    
+
+*  Take the mean of these review attributes from all reviews of the restaurant:    
+    + star rating   
+    + total votes   
+    + review age in days 
+
+* Take the mean of these user attributes from all users who reviewed the restaurant:   
+    + no. of reviews written by the user
+    + no. of fans
+    + average star rating
+    + total no. of votes
+    + total no. of friends
+    + no. of years as elite user
+    + no. of days user has been a Yelp user
+    + total no. of compliments
+    
+Pls see full coding details in [RMD chunk "summarize data"](https://a.c.c)
+```{r summarize data, warning=FALSE, echo=FALSE, cache=TRUE}
+### Exploratory analysis
+
+# 93 restaurants has no reviews, we omit these
+superDat = filter(superDat, !is.na(stars.review))
+
+# replace NA's in checkin with 0
+superDat[is.na(superDat$total_checkins.biz),]$total_checkins.biz = 0
+
+# For each restaurant,
+superDat2 = group_by(superDat, business_id, open, review_count.biz, name, stars.biz, total_checkins.biz) %>%
+    #  compute mean of the aggregrate features
+    summarise(mean_stars.review = mean(stars.review), 
+              mean_total_votes.review = mean(total_votes.review), 
+              mean_age.review = mean(age.review), 
+              mean_review_count.user = mean(review_count.user), 
+              mean_fans.user = mean(fans.user), 
+              mean_average_stars.user = mean(average_stars.user), 
+              mean_total_votes.user = mean(total_votes.user), 
+              mean_total_friends.user = mean(total_friends.user), 
+              mean_years_elite.user = mean(years_elite.user), 
+              mean_yelping_age.user = mean(yelping_age.user), 
+              mean_total_compliments.user = mean(total_compliments.user) ) 
+```
+
+
+### Perform logistic regression
+There were no near zero predictors to remove. The cleaned data was then partitioned into training and test sets with 70/30 split. On the training set, a logistic regression model was fitted and refined with bi-direction stepwise AIC model selection, resulting in a best fit model.
+```{r fit model, warning=FALSE, message=FALSE, echo=FALSE, cache=TRUE}
+library(caret)
+library(MASS)
+set.seed(1234)
+
+# Partition data into training and test set for cross-validation 
+inTrain = createDataPartition(superDat2$open, p = 0.7)[[1]]
+training = superDat2[inTrain,]
+test = superDat2[-inTrain,]
+
+# Remove near zero variance predictors
+nzv <- nearZeroVar(training)
+#training <- training[, -nzv]
+#test <- test[,-nzv]
+
+glm.out = glm(open ~ review_count.biz + total_checkins.biz + mean_stars.review + 
+                  mean_total_votes.review + mean_age.review + mean_review_count.user + mean_fans.user + 
+                  mean_average_stars.user + mean_total_votes.user + mean_total_friends.user + mean_years_elite.user + 
+                  mean_yelping_age.user + mean_total_compliments.user,  family=binomial(logit), data=training)
+
+fit.best <- step(glm.out, direction = "both", trace=0)
+```
+
+## Results
+```{r results, warning=FALSE, echo=FALSE, message=FALSE}
+summary(fit.best)
+
+library(ROCR)
+prob <- predict(fit.best, newdata=test, type="response")
+pred <- prediction(prob, test$open)
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+auc <- performance(pred, measure = "auc")
+auc <- round(auc@y.values[[1]], 3)
+
+roc.data <- data.frame(fpr=unlist(perf@x.values),
+                       tpr=unlist(perf@y.values),
+                       model="GLM")
+
+library(ggplot2)
+ggplot(roc.data, aes(x=fpr, ymin=0, ymax=tpr)) +
+    geom_ribbon(alpha=0.2) +
+    geom_line(aes(y=tpr)) +
+    ggtitle(paste0("ROC Curve w/ AUC=", auc))
+
+acc <- performance(pred, measure="acc")
+plot(acc, main="Optimal Cutoff")
+max_acc = round(max(acc@y.values[[1]]),3)
+max_acc_cutoff = round(as.numeric(acc@x.values[[1]][which.max(acc@y.values[[1]])]),3)
+abline(h=max_acc, lty=2, col=2)
+abline(v=max_acc_cutoff, lty=2, col=3)
+text(0.65, 0.7, paste0("max acc=", max_acc), col = 2)
+text(0.62, 0.25, paste0("cutoff=", max_acc_cutoff), col = 3)
+```
+
+Model summary shows the coeffcients have small P-values with at least 90% significance level.   
+The ROC plot has a AUC (area under curve) value of `r round(auc,3)`, indicates my model performance is better than a random guess (where AUC=0.5), but not a  perfect classifier (where AUC = 1.0).
+
+The Optimal Cutoff plot shows the model's best prediction accuracy @ `r max_acc`, at a probability cutoff point of `r max_acc_cutoff`
+
+## Discussion
+The results shows a correlation between the review & user data and the restaurant's open/closure.
+Further investigation should be done  on the model selection, and check for interaction between predictors as it is not apparent why some model coefficients are negative, like stars.biz, mean_total_votes.review, mean_average_stars.user,  mean_total_votes.user , mean_total_friends.user.
+
+This classifier is applicable to other businesses too. The model is quick to run, with very little performance impact, Yelp could generate such summary statistics for each business and provide insights to support business decision.   
+--- END of REPORT ---
+```{r}
+sessionInfo()
+```
